@@ -10,7 +10,7 @@
 # - Same external API surface as v1.9 (drop-in)
 #
 # Run locally
-#   uvicorn primetube_backend:app --host 0.0.0.0 --port 8080 --reload
+#   uvicorn main:app --host 0.0.0.0 --port 8080 --reload
 #
 # Deploy (Cloud Run)
 #   gcloud builds submit --tag gcr.io/PROJECT/primetube-backend:v2.0
@@ -1016,4 +1016,4 @@ async def unhandled_exceptions(request: Request, exc: Exception):
 # ------------------ Entrypoint ------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("primetube_backend:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
