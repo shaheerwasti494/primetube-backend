@@ -89,6 +89,9 @@ class Settings:
         "https://piped.video",
         "https://piped.privacydev.net",
         "https://piped.mha.fi",
+        # a couple more reliable frontends often up
+        "https://piped.projectsegfau.lt",
+        "https://piped.silkky.cloud",
     ]
 
     INVIDIOUS_POOL = [
@@ -119,7 +122,7 @@ class Settings:
     DISCOVERY_ENABLED = _env_bool("DISCOVERY_ENABLED", True)
     DISCOVERY_INTERVAL_SECONDS = _env_int("DISCOVERY_INTERVAL_SECONDS", 1800)
     INVIDIOUS_DISCOVERY_MAX = _env_int("INVIDIOUS_DISCOVERY_MAX", 8)
-    PIPED_DISCOVERY_MAX = _env_int("PIPED_DISCOVERY_MAX", 5)
+    PIPED_DISCOVERY_MAX = _env_int("PIPED_DISCOVERY_MAX", 6)
 
     INVIDIOUS_DISCOVERY_URL = os.getenv(
         "INVIDIOUS_DISCOVERY_URL", "https://api.invidious.io/instances.json"
@@ -129,7 +132,8 @@ class Settings:
         os.getenv("PIPED_DISCOVERY_URL2", "https://piped-instances.kavin.rocks/instances.json"),
     ]
 
-    HTTPX_TIMEOUT_SECONDS = _env_float("HTTPX_TIMEOUT_SECONDS", 25.0)
+    # Keep reads snappy so failover actually fails over
+    HTTPX_TIMEOUT_SECONDS = _env_float("HTTPX_TIMEOUT_SECONDS", 12.0)
 
 
 S = Settings()
@@ -149,10 +153,10 @@ app.add_middleware(
 # Shared httpx client in app.state
 async def _new_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        timeout=S.HTTPX_TIMEOUT_SECONDS,
+        timeout=httpx.Timeout(connect=5.0, read=S.HTTPX_TIMEOUT_SECONDS, write=5.0, pool=5.0),
         headers={"User-Agent": S.USER_AGENT, "Accept": "application/json, */*"},
         follow_redirects=True,
-        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
+        limits=httpx.Limits(max_keepalive_connections=32, max_connections=128),
     )
 
 
@@ -251,9 +255,15 @@ async def _discover_piped(client: httpx.AsyncClient) -> List[str]:
                     for s in arr:
                         if isinstance(s, str):
                             hosts.append(s)
+                        elif isinstance(s, dict):
+                            cand = s.get("api_url") or s.get("apiUrl") or s.get("frontend") or s.get("url")
+                            if isinstance(cand, str):
+                                hosts.append(cand)
+            # normalize -> base frontend (strip /api suffix)
             for h in hosts:
                 base = h.split("/api")[0].rstrip("/")
-                all_hosts.append(base)
+                if base:
+                    all_hosts.append(base)
         except Exception as e:
             _dbg(f"piped discovery from {url} failed: {e}")
     random.shuffle(all_hosts)
@@ -541,7 +551,10 @@ async def _get_with_failover(
     if cached is not None:
         return cached
 
+    # Shuffle order per request so one bad host doesn't stall *every* call first
     bases = (INVIDIOUS_POOL if provider == "invidious" else PIPED_POOL)[:]
+    random.shuffle(bases)
+
     last_error: Optional[Exception] = None
     tried: set[str] = set()
 
@@ -554,7 +567,6 @@ async def _get_with_failover(
         try:
             data = await _fetch_json(app.state.client, url, params)
             if require_nonempty_list and isinstance(data, list) and not data:
-                # empty payload, try next base
                 await _async_backoff()
                 continue
             if require_items_key_nonempty and isinstance(data, dict):
@@ -568,8 +580,9 @@ async def _get_with_failover(
         except httpx.HTTPStatusError as e:
             st = e.response.status_code
             last_error = e
-            # IMPORTANT: Many mirrors 403/404/451 or 429; treat these as retryable.
+            # Many mirrors 403/404/451/429; treat as retryable.
             if st in (403, 404, 451, 429) or 500 <= st < 600:
+                _dbg(f"{provider} {st} at {url} -> retry")
                 await _async_backoff(st)
                 continue
             # Other 4xx likely indicate a client error; bubble up.
@@ -604,9 +617,11 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
     except Exception as e:
         _dbg(f"invidious /trending error: {e}")
 
-    # Piped trending
+    # Piped trending (require non-empty)
     try:
-        data = await _get_with_failover("piped", "/api/trending", {"region": region})
+        data = await _get_with_failover(
+            "piped", "/api/trending", {"region": region}, cacheable=True, require_nonempty_list=True
+        )
         if isinstance(data, list) and data:
             return data, "piped_trending"
     except Exception as e:
@@ -614,7 +629,9 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
 
     # Invidious popular fallback
     try:
-        data = await _get_with_failover("invidious", "/api/v1/popular", {}, cacheable=True, require_nonempty_list=True)
+        data = await _get_with_failover(
+            "invidious", "/api/v1/popular", {}, cacheable=True, require_nonempty_list=True
+        )
         if isinstance(data, list) and data:
             return data, "invidious_popular"
     except Exception as e:
@@ -639,6 +656,8 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
                 "piped",
                 "/api/search",
                 {"q": "#shorts", "filter": "videos", "sort": "trending", "region": region},
+                cacheable=True,
+                require_items_key_nonempty=True,
             )
             items = piped_search.get("items") if isinstance(piped_search, dict) else None
             if items:
@@ -653,7 +672,8 @@ async def _unified_search(q: str, page: int, kind: str, region: str) -> Tuple[Li
     merged: List[dict] = []
     provider = "none"
 
-    # Invidious fanout (with & without region, and with type hints)
+    # Try Invidious variants (with/without region, with type hints)
+    inv_tasks = []
     for with_region in (True, False):
         base = {"q": q, "page": page}
         if with_region:
@@ -662,13 +682,19 @@ async def _unified_search(q: str, page: int, kind: str, region: str) -> Tuple[Li
             params = dict(base)
             if t:
                 params["type"] = t
-            try:
-                inv = await _get_with_failover("invidious", "/api/v1/search", params, cacheable=True)
-                if isinstance(inv, list):
-                    merged.extend(inv)
-                    provider = "invidious"
-            except Exception as e:
-                _dbg(f"inv search err {e}")
+            inv_tasks.append(
+                _get_with_failover("invidious", "/api/v1/search", params, cacheable=True)
+            )
+
+    # Fire in parallel and merge results as they arrive
+    try:
+        inv_results = await asyncio.gather(*inv_tasks, return_exceptions=True)
+        for res in inv_results:
+            if isinstance(res, list) and res:
+                merged.extend(res)
+                provider = "invidious"
+    except Exception as e:
+        _dbg(f"inv search fanout error: {e}")
 
     merged = _merge_unique(merged)
     if merged:
@@ -682,6 +708,7 @@ async def _unified_search(q: str, page: int, kind: str, region: str) -> Tuple[Li
                 "piped",
                 "/api/search",
                 {"q": q, "filter": "videos", "sort": "relevance", "page": page, "region": region},
+                require_items_key_nonempty=True,
             )
             vi = pv.get("items") if isinstance(pv, dict) else None
             if vi:
@@ -692,6 +719,7 @@ async def _unified_search(q: str, page: int, kind: str, region: str) -> Tuple[Li
                 "piped",
                 "/api/search",
                 {"q": q, "filter": "channels", "sort": "relevance", "page": page, "region": region},
+                require_items_key_nonempty=True,
             )
             ci = pc.get("items") if isinstance(pc, dict) else None
             if ci:
@@ -723,7 +751,7 @@ async def health(deep: bool = False):
         except Exception as e:
             checks.append({"invidious_trending_error": str(e)})
         try:
-            d = await _get_with_failover("piped", "/api/trending", {"region": "US"})
+            d = await _get_with_failover("piped", "/api/trending", {"region": "US"}, cacheable=False)
             checks.append({"piped_trending_len": len(d) if isinstance(d, list) else None})
         except Exception as e:
             checks.append({"piped_trending_error": str(e)})
@@ -878,7 +906,9 @@ async def related(response: Response, videoId: str = Query(..., min_length=3), p
     mapped: List[dict] = []
     # Invidious first
     try:
-        data = await _get_with_failover("invidious", f"/api/v1/related/{videoId}", {"region": region}, cacheable=True)
+        data = await _get_with_failover(
+            "invidious", f"/api/v1/related/{videoId}", {"region": region}, cacheable=True, require_nonempty_list=True
+        )
         if isinstance(data, list) and data:
             mapped = [{"type": "video", "data": map_invidious_video(d).model_dump()} for d in data if isinstance(d, dict)]
             provider = "invidious"
@@ -887,7 +917,7 @@ async def related(response: Response, videoId: str = Query(..., min_length=3), p
 
     if not mapped:
         try:
-            j = await _get_with_failover("piped", f"/api/streams/{videoId}", {})
+            j = await _get_with_failover("piped", f"/api/streams/{videoId}", {}, cacheable=True)
             rel = j.get("relatedStreams") if isinstance(j, dict) else []
             mapped = [{"type": "video", "data": map_piped_video(d).model_dump()} for d in rel if isinstance(d, dict)]
             if mapped:
@@ -960,7 +990,7 @@ async def comments(
         pp: dict = {}
         if continuation:
             pp["nextpage"] = continuation
-        d = await _get_with_failover("piped", f"/api/comments/{videoId}", pp)
+        d = await _get_with_failover("piped", f"/api/comments/{videoId}", pp, cacheable=False)
         if isinstance(d, dict):
             disabled = bool(d.get("disabled", False))
             raw = d.get("comments") or d.get("items") or []
