@@ -3,7 +3,7 @@ import time
 import json
 import itertools
 from typing import Dict, List, Optional, Tuple, Union
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -48,7 +48,7 @@ def _dbg(msg: str):
         print(f"[UPSTREAM] {msg}")
 
 # ------------------ App ---------------------
-app = FastAPI(title="PrimeTube Backend", version="1.3.0")
+app = FastAPI(title="PrimeTube Backend", version="1.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -147,7 +147,11 @@ def thumbify(arr) -> List[Thumbnail]:
         return []
     out: List[Thumbnail] = []
     for t in arr:
-        out.append(Thumbnail(url=t.get("url"), width=t.get("width"), height=t.get("height")))
+        url = t.get("url")
+        # Invidious sometimes returns relative /vi/... paths. Make them absolute.
+        if isinstance(url, str) and url.startswith("/vi/"):
+            url = f"https://i.ytimg.com{url}"
+        out.append(Thumbnail(url=url, width=t.get("width"), height=t.get("height")))
     return out
 
 def map_invidious_video(v: dict) -> VideoItem:
@@ -171,7 +175,11 @@ def map_invidious_channel(c: dict) -> ChannelItem:
     avatar = None
     thumbs = c.get("authorThumbnails") or c.get("thumbnails") or []
     if thumbs:
-        avatar = thumbs[-1].get("url")
+        # normalize /vi/... if present
+        last = thumbs[-1].get("url")
+        if isinstance(last, str) and last.startswith("/vi/"):
+            last = f"https://i.ytimg.com{last}"
+        avatar = last
     return ChannelItem(
         id=c.get("authorId") or c.get("id", ""),
         title=c.get("author") or c.get("title"),
@@ -288,11 +296,20 @@ def map_piped_video(v: dict) -> VideoItem:
     return VideoItem(
         id=vid or "",
         title=v.get("title", ""),
-        channelName=v.get("uploaderName") or v.get("uploader"),
-        channelId=v.get("uploaderId"),
+        channelName=v.get("uploaderName") or v.get("uploader") or v.get("author"),
+        channelId=v.get("uploaderId") or v.get("channelId"),
         viewCount=views,
         publishedText=v.get("uploaded") or v.get("uploadedDate"),
         thumbnails=thumbs,
+    )
+
+def map_piped_channel(c: dict) -> ChannelItem:
+    # Piped search channel shape commonly has: type="channel", name/title, thumbnail, id
+    return ChannelItem(
+        id=c.get("id") or c.get("uploaderId") or c.get("channelId") or "",
+        title=c.get("name") or c.get("uploader") or c.get("author") or c.get("title"),
+        avatar=c.get("thumbnail") or c.get("avatarUrl"),
+        subscribersText=c.get("subscriberCountText") or c.get("subscribersText"),
     )
 
 def map_piped_comment(c: dict) -> CommentItem:
@@ -419,6 +436,39 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
     _dbg("all sources empty; returning []")
     return [], "none"
 
+# ---------- Unified Search (Invidious → Piped fallback) ----------
+async def _unified_search(q: str, page: int, kind: str, region: str) -> List[dict]:
+    """
+    kind: "all" | "video" | "channel"
+    Tries Invidious first; if empty or error, tries Piped.
+    """
+    # ---- Invidious search ----
+    try:
+        inv_params = {"q": q, "page": page, "type": "all" if kind == "all" else kind, "region": region}
+        inv = await _get_json_with_failover("/api/v1/search", inv_params, cacheable=True)
+        if isinstance(inv, list) and inv:
+            return inv
+    except Exception as e:
+        _dbg(f"invidious search error: {e}")
+
+    # ---- Piped search ----
+    try:
+        piped_filter = {"all": "all", "video": "videos", "channel": "channels"}[kind]
+        pip = await _piped_json("/api/search", {
+            "q": q,
+            "filter": piped_filter,
+            "sort": "relevance",
+            "region": region,
+            "page": page
+        })
+        items = pip.get("items") if isinstance(pip, dict) else None
+        if items:
+            return items
+    except Exception as e:
+        _dbg(f"piped search error: {e}")
+
+    return []
+
 # ------------------ Endpoints ------------------
 @app.get("/health")
 async def health(deep: bool = False):
@@ -450,33 +500,43 @@ async def suggest(q: str = Query(..., min_length=1)):
     return SuggestResponse(suggestions=variants[:8])
 
 @app.get("/v1/search", response_model=SearchResponse)
-async def search(q: str, page: int = 1):
-    path = "/api/v1/search"
-    params = {"q": q, "page": page, "type": "all"}
-    data = await _get_json_with_failover(path, params, cacheable=True)
-    if not isinstance(data, list):
-        data = []
+async def search(q: str, page: int = 1, region: str = "US"):
+    raw = await _unified_search(q=q, page=page, kind="all", region=region)
     items: List[dict] = []
-    for it in data:
+    for it in raw:
         t = it.get("type")
+        # Invidious-style
         if t == "video":
             items.append({"type": "video", "data": map_invidious_video(it).model_dump()})
         elif t == "channel":
             items.append({"type": "channel", "data": map_invidious_channel(it).model_dump()})
-    next_page = page + 1 if len(data) > 0 else None
+        else:
+            # Piped-style disambiguation
+            if any(k in it for k in ("thumbnail", "thumbnailUrl", "uploader", "uploaderName", "url")):
+                items.append({"type": "video", "data": map_piped_video(it).model_dump()})
+            elif it.get("type") == "channel" or any(k in it for k in ("name", "avatarUrl")):
+                items.append({"type": "channel", "data": map_piped_channel(it).model_dump()})
+    next_page = page + 1 if raw else None
     return SearchResponse(items=items, nextPage=next_page)
 
 @app.get("/v1/channels", response_model=SearchResponse)
-async def channels(q: str, page: int = 1):
-    path = "/api/v1/search"
-    params = {"q": q, "page": page, "type": "channel"}
-    data = await _get_json_with_failover(path, params, cacheable=True)
-    if not isinstance(data, list):
-        data = []
-    items = [{"type": "channel", "data": map_invidious_channel(it).model_dump()} for it in data]
-    return SearchResponse(items=items, nextPage=(page + 1 if items else None))
-
-from fastapi import Response
+async def channels(q: str, page: int = 1, region: str = "US"):
+    raw = await _unified_search(q=q, page=page, kind="channel", region=region)
+    items: List[dict] = []
+    for it in raw:
+        # Prefer exact type=channel when present
+        if it.get("type") == "channel":
+            # Try Piped first, fallback to Invidious mapper shape
+            ch = map_piped_channel(it).model_dump()
+            if not ch.get("id") and (it.get("authorId") or it.get("author")):
+                ch = map_invidious_channel(it).model_dump()
+            items.append({"type": "channel", "data": ch})
+        elif any(k in it for k in ("authorId", "author", "authorThumbnails", "thumbnails")):
+            items.append({"type": "channel", "data": map_invidious_channel(it).model_dump()})
+        else:
+            items.append({"type": "channel", "data": map_piped_channel(it).model_dump()})
+    next_page = page + 1 if raw else None
+    return SearchResponse(items=items, nextPage=next_page)
 
 @app.get("/v1/trending", response_model=SearchResponse)
 async def trending(response: Response, page: int = 1, region: str = "US"):
