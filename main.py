@@ -1,9 +1,8 @@
-# main.py
 import os
 import time
 import json
 import itertools
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,11 +36,19 @@ CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 minutes
 
 USER_AGENT = os.getenv(
     "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
     "PrimeTubeBackend/1.0 (CloudRun) httpx"
 )
 
+DEBUG_UPSTREAM = os.getenv("DEBUG_UPSTREAM", "0") == "1"
+
+def _dbg(msg: str):
+    if DEBUG_UPSTREAM:
+        print(f"[UPSTREAM] {msg}")
+
 # ------------------ App ---------------------
-app = FastAPI(title="PrimeTube Backend", version="1.2.0")
+app = FastAPI(title="PrimeTube Backend", version="1.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,6 +132,15 @@ def cache_set(path: str, params: dict, data: object, ttl: Optional[int] = None):
     t = ttl if ttl is not None else CACHE_TTL
     _cache[key] = (time.time() + t, data)
 
+def _cacheable_nonempty(data: object) -> bool:
+    if isinstance(data, list):
+        return len(data) > 0
+    if isinstance(data, dict):
+        items = data.get("items")
+        if isinstance(items, list):
+            return len(items) > 0
+    return False
+
 # ------------------ Invidious helpers ------------------
 def thumbify(arr) -> List[Thumbnail]:
     if not isinstance(arr, list):
@@ -184,7 +200,19 @@ async def _fetch_json_once(base: str, path: str, params: dict) -> object:
         r.raise_for_status()
         return r.json()
 
-async def _get_json_with_failover(path: str, params: dict, cacheable: bool = True) -> object:
+async def _get_json_with_failover(
+    path: str,
+    params: dict,
+    cacheable: bool = True,
+    require_nonempty_list: bool = False,
+    require_items_key_nonempty: bool = False,
+) -> object:
+    """
+    Fetch JSON from Invidious pool with failover.
+    If require_nonempty_list=True, empty [] is treated as a soft failure and the next mirror is tried.
+    If require_items_key_nonempty=True, empty dict.items list is treated as soft failure.
+    Only non-empty payloads are cached.
+    """
     cached = cache_get(path, params) if cacheable else None
     if cached is not None:
         return cached
@@ -198,12 +226,22 @@ async def _get_json_with_failover(path: str, params: dict, cacheable: bool = Tru
         tried.add(base)
         try:
             data = await _fetch_json_once(base, path, params)
-            if cacheable:
+            # gate non-empty if required
+            if require_nonempty_list and isinstance(data, list) and len(data) == 0:
+                _dbg(f"{base}{path} returned empty list; trying next mirror")
+                continue
+            if require_items_key_nonempty and isinstance(data, dict):
+                items = data.get("items")
+                if isinstance(items, list) and len(items) == 0:
+                    _dbg(f"{base}{path} returned dict with empty items; trying next mirror")
+                    continue
+
+            # cache only if meaningfully non-empty
+            if cacheable and _cacheable_nonempty(data):
                 cache_set(path, params, data)
             return data
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            # Retry on 429 or 5xx; error out for other 4xx.
             if status == 429 or (500 <= status < 600):
                 await _async_backoff(status)
                 last_error = e
@@ -214,6 +252,7 @@ async def _get_json_with_failover(path: str, params: dict, cacheable: bool = Tru
             await _async_backoff()
             continue
 
+    # try to return any stale cached value (which would have been non-empty by our policy)
     if cacheable:
         stale = cache_get(path, params)
         if stale is not None:
@@ -257,7 +296,6 @@ def map_piped_video(v: dict) -> VideoItem:
     )
 
 def map_piped_comment(c: dict) -> CommentItem:
-    # Piped typically: commentId, author, commentText, commentedTime, likeCount, replies?
     return CommentItem(
         id=c.get("commentId") or c.get("id"),
         author=c.get("author"),
@@ -277,13 +315,13 @@ async def _piped_json(path: str, params: dict) -> object:
         return r.json()
 
 # ---------- Unified trending/shorts with deep fallback ----------
-async def _trending_videos(region: str, shorts_only: bool) -> List[dict]:
+async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], str]:
     """
-    Returns raw list of video dicts from any of:
+    Returns (raw list of video dicts, source_tag) from any of:
     1) Invidious /trending (optionally Shorts)
     2) Piped /trending (or Piped search trending for #shorts)
     3) Invidious /popular
-    4) Invidious /search sort_by=trending (q empty or #shorts)
+    4) Invidious /search sort_by=trending (q #shorts only)
     5) Piped /api/search sort=trending (q empty or #shorts)
     """
     # ---- 1) Invidious: /trending ----
@@ -291,11 +329,17 @@ async def _trending_videos(region: str, shorts_only: bool) -> List[dict]:
     if shorts_only:
         inv_params["type"] = "Shorts"
     try:
-        data = await _get_json_with_failover("/api/v1/trending", inv_params, cacheable=True)
+        data = await _get_json_with_failover(
+            "/api/v1/trending",
+            inv_params,
+            cacheable=True,
+            require_nonempty_list=True,
+        )
         if isinstance(data, list) and data:
-            return data
-    except Exception:
-        pass
+            _dbg(f"invidious /trending shorts={shorts_only} got {len(data)}")
+            return data, "invidious_trending"
+    except Exception as e:
+        _dbg(f"invidious /trending error: {e}")
 
     # ---- 2) Piped ----
     try:
@@ -308,35 +352,54 @@ async def _trending_videos(region: str, shorts_only: bool) -> List[dict]:
             })
             items = data.get("items") if isinstance(data, dict) else None
             if items:
-                return items
+                _dbg(f"piped #shorts search got {len(items)}")
+                return items, "piped_search_shorts"
+            # secondary attempt: try piped trending if shorts search empty
+            alt = await _piped_json("/api/trending", {"region": region})
+            if isinstance(alt, list) and alt:
+                _dbg(f"piped /trending as shorts fallback got {len(alt)}")
+                return alt, "piped_trending_as_shorts"
         else:
             data = await _piped_json("/api/trending", {"region": region})
             if isinstance(data, list) and data:
-                return data
-    except Exception:
-        pass
+                _dbg(f"piped /trending got {len(data)}")
+                return data, "piped_trending"
+    except Exception as e:
+        _dbg(f"piped path error: {e}")
 
     # ---- 3) Invidious: /popular ----
     try:
-        data = await _get_json_with_failover("/api/v1/popular", {}, cacheable=True)
+        data = await _get_json_with_failover(
+            "/api/v1/popular", {},
+            cacheable=True,
+            require_nonempty_list=True,
+        )
         if isinstance(data, list) and data:
-            return data
-    except Exception:
-        pass
+            _dbg(f"invidious /popular got {len(data)}")
+            return data, "invidious_popular"
+    except Exception as e:
+        _dbg(f"invidious /popular error: {e}")
 
     # ---- 4) Invidious: /search with sort_by=trending ----
     try:
-        inv_search_params = {
-            "q": "#shorts" if shorts_only else "",
-            "type": "video",
-            "sort_by": "trending",
-            "region": region,
-        }
-        inv_search = await _get_json_with_failover("/api/v1/search", inv_search_params, cacheable=True)
-        if isinstance(inv_search, list) and inv_search:
-            return inv_search
-    except Exception:
-        pass
+        if shorts_only:
+            inv_search_params = {
+                "q": "#shorts",
+                "type": "video",
+                "sort_by": "trending",
+                "region": region,
+            }
+            inv_search = await _get_json_with_failover(
+                "/api/v1/search",
+                inv_search_params,
+                cacheable=True,
+                require_nonempty_list=True,
+            )
+            if isinstance(inv_search, list) and inv_search:
+                _dbg(f"invidious search(#shorts, trending) got {len(inv_search)}")
+                return inv_search, "invidious_search_shorts_trending"
+    except Exception as e:
+        _dbg(f"invidious search trending error: {e}")
 
     # ---- 5) Piped: /api/search with sort=trending ----
     try:
@@ -348,21 +411,37 @@ async def _trending_videos(region: str, shorts_only: bool) -> List[dict]:
         })
         items = piped_search.get("items") if isinstance(piped_search, dict) else None
         if items:
-            return items
-    except Exception:
-        pass
+            _dbg(f"piped search(trending) got {len(items)}")
+            return items, "piped_search_trending"
+    except Exception as e:
+        _dbg(f"piped search trending error: {e}")
 
-    return []
+    _dbg("all sources empty; returning []")
+    return [], "none"
 
 # ------------------ Endpoints ------------------
 @app.get("/health")
-async def health():
-    return {
+async def health(deep: bool = False):
+    info: Dict[str, Union[bool, int, List[str], str, List[dict]]] = {
         "ok": True,
         "active_pool": INVIDIOUS_POOL,
         "piped": PIPED_BASE,
         "cache_ttl": CACHE_TTL,
     }
+    if deep:
+        checks = []
+        try:
+            d = await _get_json_with_failover("/api/v1/trending", {"region":"US"}, cacheable=False, require_nonempty_list=False)
+            checks.append({"invidious_trending_len": len(d) if isinstance(d, list) else None})
+        except Exception as e:
+            checks.append({"invidious_trending_error": str(e)})
+        try:
+            d = await _piped_json("/api/trending", {"region":"US"})
+            checks.append({"piped_trending_len": len(d) if isinstance(d, list) else None})
+        except Exception as e:
+            checks.append({"piped_trending_error": str(e)})
+        info["checks"] = checks
+    return info
 
 @app.get("/v1/suggest", response_model=SuggestResponse)
 async def suggest(q: str = Query(..., min_length=1)):
@@ -397,9 +476,11 @@ async def channels(q: str, page: int = 1):
     items = [{"type": "channel", "data": map_invidious_channel(it).model_dump()} for it in data]
     return SearchResponse(items=items, nextPage=(page + 1 if items else None))
 
+from fastapi import Response
+
 @app.get("/v1/trending", response_model=SearchResponse)
-async def trending(page: int = 1, region: str = "US"):
-    data = await _trending_videos(region=region, shorts_only=False)
+async def trending(response: Response, page: int = 1, region: str = "US"):
+    data, source = await _trending_videos(region=region, shorts_only=False)
     per_page = 20
     start = (page - 1) * per_page
     end = start + per_page
@@ -413,11 +494,14 @@ async def trending(page: int = 1, region: str = "US"):
             items.append({"type": "video", "data": map_piped_video(v).model_dump()})
 
     next_page = page + 1 if end < len(data) else None
+    if DEBUG_UPSTREAM:
+        response.headers["X-PT-Source"] = source
+        response.headers["X-PT-Total"] = str(len(data))
     return SearchResponse(items=items, nextPage=next_page)
 
 @app.get("/v1/shorts", response_model=ShortItemsResponse)
-async def shorts(page: int = 1, region: str = "US"):
-    data = await _trending_videos(region=region, shorts_only=True)
+async def shorts(response: Response, page: int = 1, region: str = "US"):
+    data, source = await _trending_videos(region=region, shorts_only=True)
     per_page = 20
     start = (page - 1) * per_page
     end = start + per_page
@@ -431,6 +515,9 @@ async def shorts(page: int = 1, region: str = "US"):
             vids.append(map_piped_video(v).model_dump())
 
     next_page = page + 1 if end < len(data) else None
+    if DEBUG_UPSTREAM:
+        response.headers["X-PT-Source"] = source
+        response.headers["X-PT-Total"] = str(len(data))
     return ShortItemsResponse(items=vids, nextPage=next_page)
 
 @app.get("/v1/videoStats")
@@ -491,7 +578,6 @@ async def comments(
         if continuation:
             piped_params["nextpage"] = continuation
         data = await _piped_json(f"/api/comments/{videoId}", piped_params)
-        # Piped shape: { comments:[...], nextpage?: "...", disabled?: bool }
         if isinstance(data, dict):
             disabled = bool(data.get("disabled", False))
             raw = data.get("comments") or data.get("items") or []
@@ -504,7 +590,6 @@ async def comments(
     except Exception:
         pass
 
-    # If both sources failed or comments truly disabled:
     return CommentsResponse(disabled=True, items=[], nextPage=None)
 
 # -------- Nice JSON for unhandled errors ----------
