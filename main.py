@@ -1,3 +1,4 @@
+# main.py
 import os
 import time
 import json
@@ -14,7 +15,18 @@ load_dotenv()
 
 # ------------------ Config ------------------
 DEFAULT_INVIDIOUS = "https://yewtu.be"
-POOL_ENV = os.getenv("INVIDIOUS_POOL", DEFAULT_INVIDIOUS)
+POOL_ENV = os.getenv(
+    "INVIDIOUS_POOL",
+    ",".join([
+        "https://inv.nadeko.net",
+        "https://invidious.fdn.fr",
+        "https://yewtu.be",
+        "https://vid.puffyan.us",
+        "https://invidious.nerdvpn.de",
+        "https://iv.nboeck.de",
+        "https://invidious.privacydev.net",
+    ])
+)
 INVIDIOUS_POOL: List[str] = [b.strip().rstrip("/") for b in POOL_ENV.split(",") if b.strip()]
 if not INVIDIOUS_POOL:
     INVIDIOUS_POOL = [DEFAULT_INVIDIOUS]
@@ -264,37 +276,83 @@ async def _piped_json(path: str, params: dict) -> object:
         r.raise_for_status()
         return r.json()
 
-# ---------- Unified trending/shorts with fallback ----------
+# ---------- Unified trending/shorts with deep fallback ----------
 async def _trending_videos(region: str, shorts_only: bool) -> List[dict]:
-    # 1) Try Invidious
+    """
+    Returns raw list of video dicts from any of:
+    1) Invidious /trending (optionally Shorts)
+    2) Piped /trending (or Piped search trending for #shorts)
+    3) Invidious /popular
+    4) Invidious /search sort_by=trending (q empty or #shorts)
+    5) Piped /api/search sort=trending (q empty or #shorts)
+    """
+    # ---- 1) Invidious: /trending ----
     inv_params = {"region": region}
     if shorts_only:
         inv_params["type"] = "Shorts"
     try:
         data = await _get_json_with_failover("/api/v1/trending", inv_params, cacheable=True)
-        if isinstance(data, list):
+        if isinstance(data, list) and data:
             return data
     except Exception:
-        pass  # go to piped
+        pass
 
-    # 2) Piped fallback
+    # ---- 2) Piped ----
     try:
         if shorts_only:
-            # There isn't a universal "shorts" endpoint across all Piped instances:
-            # use trending search for #shorts.
             data = await _piped_json("/api/search", {
                 "q": "#shorts",
                 "filter": "videos",
-                "region": region,
                 "sort": "trending",
+                "region": region,
             })
             items = data.get("items") if isinstance(data, dict) else None
-            return items or []
+            if items:
+                return items
         else:
             data = await _piped_json("/api/trending", {"region": region})
-            return data if isinstance(data, list) else []
+            if isinstance(data, list) and data:
+                return data
     except Exception:
-        return []
+        pass
+
+    # ---- 3) Invidious: /popular ----
+    try:
+        data = await _get_json_with_failover("/api/v1/popular", {}, cacheable=True)
+        if isinstance(data, list) and data:
+            return data
+    except Exception:
+        pass
+
+    # ---- 4) Invidious: /search with sort_by=trending ----
+    try:
+        inv_search_params = {
+            "q": "#shorts" if shorts_only else "",
+            "type": "video",
+            "sort_by": "trending",
+            "region": region,
+        }
+        inv_search = await _get_json_with_failover("/api/v1/search", inv_search_params, cacheable=True)
+        if isinstance(inv_search, list) and inv_search:
+            return inv_search
+    except Exception:
+        pass
+
+    # ---- 5) Piped: /api/search with sort=trending ----
+    try:
+        piped_search = await _piped_json("/api/search", {
+            "q": "#shorts" if shorts_only else "",
+            "filter": "videos",
+            "sort": "trending",
+            "region": region,
+        })
+        items = piped_search.get("items") if isinstance(piped_search, dict) else None
+        if items:
+            return items
+    except Exception:
+        pass
+
+    return []
 
 # ------------------ Endpoints ------------------
 @app.get("/health")
@@ -415,18 +473,14 @@ async def comments(
         params = {"hl": "en"}
         if continuation:
             params["continuation"] = continuation
-            path = f"/api/v1/comments/{videoId}"
-        else:
-            path = f"/api/v1/comments/{videoId}"
+        path = f"/api/v1/comments/{videoId}"
         data = await _get_json_with_failover(path, params, cacheable=False)
 
         if isinstance(data, dict):
-            # Invidious shape: { comments:[...], continuation?: "...", commentCount, disabled? }
             disabled = bool(data.get("disabled") or data.get("commentsDisabled", False))
             raw = data.get("comments") or []
-            items = [map_invidious_comment(c).model_dump() for c in raw]
+            items = [map_invidious_comment(c).model_dump() for c in raw if isinstance(c, dict)]
             next_token = data.get("continuation")
-            # Heuristic: if comments empty and disabled flag, surface disabled
             return CommentsResponse(disabled=disabled, items=items, nextPage=next_token)
     except Exception:
         pass
@@ -435,7 +489,6 @@ async def comments(
     try:
         piped_params = {}
         if continuation:
-            # some Piped instances use "nextpage" for continuation
             piped_params["nextpage"] = continuation
         data = await _piped_json(f"/api/comments/{videoId}", piped_params)
         # Piped shape: { comments:[...], nextpage?: "...", disabled?: bool }
@@ -445,14 +498,13 @@ async def comments(
             items = [map_piped_comment(c).model_dump() for c in raw if isinstance(c, dict)]
             next_token = data.get("nextpage") or data.get("nextPage")
             return CommentsResponse(disabled=disabled, items=items, nextPage=next_token)
-        # sometimes lists are returned
         if isinstance(data, list):
             items = [map_piped_comment(c).model_dump() for c in data if isinstance(c, dict)]
             return CommentsResponse(disabled=False, items=items, nextPage=None)
     except Exception:
         pass
 
-    # If both sources failed:
+    # If both sources failed or comments truly disabled:
     return CommentsResponse(disabled=True, items=[], nextPage=None)
 
 # -------- Nice JSON for unhandled errors ----------
