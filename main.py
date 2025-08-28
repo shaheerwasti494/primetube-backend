@@ -1,25 +1,24 @@
-"""
-PrimeTube Backend — v2.0 (FastAPI)
+# PrimeTube Backend — v2.0 (FastAPI)
+#
+# Goals
+# - Simplified, readable, and maintainable single-file backend
+# - Shared httpx client with connection pooling
+# - Clean failover across Invidious & Piped with one helper
+# - Self-healing instance discovery (startup + periodic)
+# - Small in-memory TTL cache for non-auth GETs
+# - Useful debugging headers behind DEBUG_UPSTREAM
+# - Same external API surface as v1.9 (drop-in)
+#
+# Run locally
+#   uvicorn primetube_backend:app --host 0.0.0.0 --port 8080 --reload
+#
+# Deploy (Cloud Run)
+#   gcloud builds submit --tag gcr.io/PROJECT/primetube-backend:v2.0
+#   gcloud run deploy primetube-backend \
+#     --image gcr.io/PROJECT/primetube-backend:v2.0 \
+#     --allow-unauthenticated --region=us-central1 \
+#     --set-env-vars=DEBUG_UPSTREAM=1
 
-Goals
-- Simplified, readable, and maintainable single-file backend
-- Shared httpx client with connection pooling
-- Clean failover across Invidious & Piped with one helper
-- Self-healing instance discovery (startup + periodic)
-- Small in‑memory TTL cache for non‑auth GETs
-- Useful debugging headers behind DEBUG_UPSTREAM
-- Same external API surface as v1.9 (drop-in)
-
-Run locally
-  uvicorn primetube_backend:app --host 0.0.0.0 --port 8080 --reload
-
-Deploy (Cloud Run)
-  gcloud builds submit --tag gcr.io/PROJECT/primetube-backend:v2.0
-  gcloud run deploy primetube-backend \
-    --image gcr.io/PROJECT/primetube-backend:v2.0 \
-    --allow-unauthenticated --region=us-central1 \
-    --set-env-vars=DEBUG_UPSTREAM=1
-"""
 from __future__ import annotations
 
 import asyncio
@@ -35,6 +34,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
 
 # ------------ Safe env helpers (tolerate empty/invalid) ------------
 def _env_str(name: str, default: str | None = None) -> str | None:
@@ -68,12 +68,13 @@ def _env_bool(name: str, default: bool) -> bool:
         return default
     return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
+
 try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except Exception:
     pass
+
 
 # ------------------ Config ------------------
 class Settings:
@@ -133,6 +134,7 @@ class Settings:
 
 S = Settings()
 
+
 # ------------------ App ------------------
 app = FastAPI(title="PrimeTube Backend", version="2.0")
 app.add_middleware(
@@ -142,6 +144,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Shared httpx client in app.state
 async def _new_client() -> httpx.AsyncClient:
@@ -172,7 +175,7 @@ _cache: Dict[str, Tuple[float, object]] = {}
 
 
 def _cache_key(path: str, params: dict) -> str:
-    return f"{path}?{json.dumps(params, sort_keys=True, separators=(",", ":"))}"
+    return f"{path}?{json.dumps(params, sort_keys=True, separators=(',', ':'))}"
 
 
 def cache_get(path: str, params: dict):
@@ -401,7 +404,6 @@ def _merge_unique(seq: Iterable[dict]) -> List[dict]:
 
 
 # Invidious mappers
-
 def _thumbify(arr) -> List[Thumbnail]:
     if not isinstance(arr, list):
         return []
@@ -462,11 +464,9 @@ def map_invidious_comment(c: dict) -> CommentItem:
 
 
 # Piped mappers
-
 def _piped_extract_id_from_url(url: str) -> str:
     try:
         from urllib.parse import parse_qs, urlparse
-
         qs = parse_qs(urlparse(url).query)
         return (qs.get("v") or [""])[0]
     except Exception:
@@ -528,7 +528,10 @@ async def _fetch_json(client: httpx.AsyncClient, url: str, params: dict) -> obje
 
 
 async def _get_with_failover(
-    provider: str, path: str, params: dict, *,
+    provider: str,
+    path: str,
+    params: dict,
+    *,
     cacheable: bool = True,
     require_nonempty_list: bool = False,
     require_items_key_nonempty: bool = False,
@@ -551,10 +554,13 @@ async def _get_with_failover(
         try:
             data = await _fetch_json(app.state.client, url, params)
             if require_nonempty_list and isinstance(data, list) and not data:
+                # empty payload, try next base
+                await _async_backoff()
                 continue
             if require_items_key_nonempty and isinstance(data, dict):
                 items = data.get("items")
                 if isinstance(items, list) and not items:
+                    await _async_backoff()
                     continue
             if cacheable and _cacheable_nonempty(data):
                 cache_set(f"{provider}:{path}", params, data)
@@ -562,9 +568,11 @@ async def _get_with_failover(
         except httpx.HTTPStatusError as e:
             st = e.response.status_code
             last_error = e
-            if st == 429 or 500 <= st < 600:
+            # IMPORTANT: Many mirrors 403/404/451 or 429; treat these as retryable.
+            if st in (403, 404, 451, 429) or 500 <= st < 600:
                 await _async_backoff(st)
                 continue
+            # Other 4xx likely indicate a client error; bubble up.
             raise HTTPException(status_code=st, detail=f"Upstream {provider} error {st} at {url}") from e
         except Exception as e:
             last_error = e
@@ -585,6 +593,7 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
     inv_params = {"region": region}
     if shorts_only:
         inv_params["type"] = "Shorts"
+
     # Invidious trending
     try:
         data = await _get_with_failover(
@@ -611,7 +620,7 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
     except Exception as e:
         _dbg(f"invidious /popular error: {e}")
 
-    # Shorts-specific searches
+    # Shorts-specific searches (last resort)
     if shorts_only:
         try:
             inv_search = await _get_with_failover(
@@ -644,7 +653,7 @@ async def _unified_search(q: str, page: int, kind: str, region: str) -> Tuple[Li
     merged: List[dict] = []
     provider = "none"
 
-    # Invidious fanout (with & without region)
+    # Invidious fanout (with & without region, and with type hints)
     for with_region in (True, False):
         base = {"q": q, "page": page}
         if with_region:
@@ -977,5 +986,4 @@ async def unhandled_exceptions(request: Request, exc: Exception):
 # ------------------ Entrypoint ------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("primetube_backend:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
