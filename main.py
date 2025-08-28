@@ -1,298 +1,295 @@
-from __future__ import annotations
-
-import asyncio
 import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import JSONResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-# -------------------- Config --------------------
+load_dotenv()
 
-PIPED_INSTANCES = [
-    "https://piped.video",
-    "https://pipedapi.kavin.rocks",
-    "https://piped.hostux.net",
-]
-INVIDIOUS_INSTANCES = [
-    "https://yt.artemislena.eu",
-    "https://invidious.nerdvpn.de",
-    "https://invidious.flokinet.to",
-]
+# -------- config --------
+INVIDIOUS_BASE = os.getenv("INVIDIOUS_BASE", "https://yewtu.be").rstrip("/")
+PIPED_BASE     = os.getenv("PIPED_BASE", "https://piped.video").rstrip("/")
+HTTP_TIMEOUT   = float(os.getenv("HTTP_TIMEOUT", "20"))
+CORS_ENV       = os.getenv("CORS_ORIGINS", "*").strip()
+CORS_ORIGINS   = ["*"] if CORS_ENV == "*" else [o.strip() for o in CORS_ENV.split(",") if o.strip()]
 
-HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "7"))
-CACHE_SECONDS_DEFAULT = int(os.getenv("CACHE_SECONDS_DEFAULT", "300"))
-REGION_DEFAULT = os.getenv("REGION_DEFAULT", "US")
-
-app = FastAPI(title="PrimeTube Backend", version="1.0.0")
+app = FastAPI(title="PrimeTube Backend", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later if you want
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(HTTP_TIMEOUT),
-    headers={"User-Agent": "primetube-backend/1.0"},
-    http2=True,
-)
+# One pooled async client for all requests (faster + fewer sockets)
+_http: Optional[httpx.AsyncClient] = None
 
-# -------------------- Helpers --------------------
 
-async def _get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-    try:
-        r = await client.get(url, params=params)
-        if r.status_code == 200:
-            return r.json()
-        return None
-    except Exception:
-        return None
-
-async def fetch_first_ok(urls: List[str], path: str, params: Dict[str, Any]) -> Tuple[str, Any]:
-    """
-    Try a list of base URLs and return the first JSON that works.
-    """
-    for base in urls:
-        data = await _get_json(f"{base}{path}", params)
-        if data is not None:
-            return base, data
-    raise HTTPException(status_code=502, detail="Upstream temporarily unavailable")
-
-def _thumbs_to_set(thumbs: List[Dict[str, Any]] | None) -> Dict[str, Optional[str]]:
-    if not thumbs:
-        return {"defaultUrl": None, "mediumUrl": None, "highUrl": None}
-    # Piped/Inv thumbnails can be in various sizes; pick a few common ones
-    best = sorted(thumbs, key=lambda t: t.get("height") or 0)
-    return {
-        "defaultUrl": best[0]["url"] if best else None,
-        "mediumUrl": best[len(best)//2]["url"] if best else None,
-        "highUrl": best[-1]["url"] if best else None,
-    }
-
-def _video_item_from_piped(v: Dict[str, Any]) -> Dict[str, Any]:
-    # Piped trending/search video fields vary a bit across endpoints
-    vid = v.get("id") or v.get("url") or v.get("shortId") or v.get("videoId")
-    title = v.get("title")
-    channel_name = v.get("uploaderName") or v.get("uploader") or v.get("author")
-    channel_id = v.get("uploaderId") or v.get("uploaderUrl") or v.get("authorId")
-    # stats
-    views = v.get("views") or v.get("viewCount") or 0
-    likes = v.get("likeCount") or None
-    comments = v.get("commentCount") or None
-    published_text = v.get("uploadedDate") or v.get("publishedText") or None
-    thumbnails = v.get("thumbnail") or v.get("thumbnailUrl")
-    if isinstance(thumbnails, str):
-        thumbs = [{"url": thumbnails, "height": 720}]
-    else:
-        thumbs = v.get("thumbnails") or []
-    return {
-        "type": "video",
-        "data": {
-            "id": str(vid).replace("/watch?v=", "").replace("/shorts/", ""),
-            "title": title,
-            "channelId": channel_id,
-            "channelName": channel_name,
-            "publishedText": published_text,
-            "viewCount": int(views) if isinstance(views, (int, float, str)) and str(views).isdigit() else None,
-            "likeCount": likes if isinstance(likes, int) else None,
-            "commentCount": comments if isinstance(comments, int) else None,
-            "thumbnails": _thumbs_to_set(thumbs if isinstance(thumbs, list) else None),
-        },
-    }
-
-def _channel_item_from_piped(c: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "type": "channel",
-        "data": {
-            "id": c.get("uploaderId") or c.get("channelId") or c.get("id"),
-            "title": c.get("uploaderName") or c.get("name") or c.get("author"),
-            "avatar": (c.get("uploaderAvatar") or c.get("authorThumbnails", [{}])[-1].get("url") if c.get("authorThumbnails") else None),
-        },
-    }
-
-def cacheable(payload: Any, max_age: int = CACHE_SECONDS_DEFAULT) -> JSONResponse:
-    return JSONResponse(
-        payload,
-        headers={"Cache-Control": f"public, max-age={max_age}"}
+@app.on_event("startup")
+async def _startup():
+    global _http
+    _http = httpx.AsyncClient(
+        timeout=HTTP_TIMEOUT,
+        headers={"user-agent": "primetube-backend/1.1"},
+        follow_redirects=True,
     )
 
-# -------------------- Routes --------------------
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-@app.get("/trending")
-async def trending(
-    region: str = Query(REGION_DEFAULT, min_length=2, max_length=5),
-    limit: int = Query(20, ge=1, le=50),
-    stats: bool = Query(False, description="Fetch per-video stats (slower)")
-):
-    """
-    Get trending videos via Piped (fallback to Invidious).
-    """
-    # Piped
-    try:
-        base, data = await fetch_first_ok(PIPED_INSTANCES, "/api/v1/trending", {"region": region})
-        items_raw = data if isinstance(data, list) else []
-        items = [_video_item_from_piped(v) for v in items_raw[:limit]]
-        return cacheable({"items": items, "nextPage": None})
-    except HTTPException:
-        pass
-
-    # Invidious fallback
-    base, data = await fetch_first_ok(INVIDIOUS_INSTANCES, "/api/v1/trending", {"region": region})
-    items_raw = data if isinstance(data, list) else []
-    items = []
-    for v in items_raw[:limit]:
-        # map invidious keys to our shape
-        mapped = {
-            "id": v.get("videoId"),
-            "title": v.get("title"),
-            "channelId": v.get("authorId"),
-            "channelName": v.get("author"),
-            "publishedText": v.get("publishedText"),
-            "viewCount": v.get("viewCount"),
-            "likeCount": v.get("likeCount"),
-            "commentCount": v.get("commentCount"),
-            "thumbnails": _thumbs_to_set(v.get("videoThumbnails")),
-        }
-        items.append({"type": "video", "data": mapped})
-    return cacheable({"items": items, "nextPage": None})
-
-@app.get("/shorts")
-async def shorts(
-    page: int | None = Query(None, ge=1),
-    limit: int = Query(20, ge=1, le=50),
-    region: str = Query(REGION_DEFAULT),
-):
-    """
-    Return short videos (<= 90s). Uses Piped search with a shorts filter when available,
-    otherwise filters by duration.
-    """
-    q = "#shorts"
-    params = {"q": q, "page": page or 1}
-    # Piped search
-    base, data = await fetch_first_ok(PIPED_INSTANCES, "/api/v1/search", params)
-    items_raw = data.get("items") or data if isinstance(data, dict) else []
-    out: List[Dict[str, Any]] = []
-    for it in items_raw:
-        # Only keep videos which look like shorts
-        dur = it.get("duration") or it.get("lengthSeconds")
-        try:
-            is_short = dur is not None and int(dur) <= 90
-        except Exception:
-            is_short = False
-        if it.get("type") in ("stream", "video") and (is_short or "#shorts" in (it.get("title") or "").lower()):
-            out.append(_video_item_from_piped(it))
-        if len(out) >= limit:
-            break
-
-    next_page = (page or 1) + 1 if len(items_raw) else None
-    return cacheable({"items": out, "nextPage": next_page})
-
-@app.get("/search")
-async def search(
-    q: str = Query(..., min_length=1),
-    page: int | None = Query(None, ge=1),
-    limit: int = Query(20, ge=1, le=50),
-):
-    """
-    Mixed search; videos + channels using Piped (fallback to Invidious).
-    """
-    # Piped
-    base, data = await fetch_first_ok(PIPED_INSTANCES, "/api/v1/search", {"q": q, "page": page or 1})
-    items_raw = data.get("items") or data if isinstance(data, dict) else []
-    items: List[Dict[str, Any]] = []
-    for it in items_raw:
-        t = (it.get("type") or "").lower()
-        if t in ("stream", "video"):
-            items.append(_video_item_from_piped(it))
-        elif t in ("channel", "channelList"):
-            items.append(_channel_item_from_piped(it))
-        if len(items) >= limit:
-            break
-    next_page = (page or 1) + 1 if len(items_raw) else None
-    return cacheable({"items": items, "nextPage": next_page})
-
-@app.get("/channels")
-async def channels(
-    q: str = Query(..., min_length=1),
-    page: int | None = Query(None, ge=1)
-):
-    """
-    Channel-only search.
-    """
-    base, data = await fetch_first_ok(PIPED_INSTANCES, "/api/v1/search", {"q": q, "page": page or 1, "filter": "channels"})
-    items_raw = data.get("items") or data if isinstance(data, dict) else []
-    items = [_channel_item_from_piped(it) for it in items_raw if (it.get("type") or "").lower().startswith("channel")]
-    next_page = (page or 1) + 1 if len(items_raw) else None
-    return cacheable({"items": items, "nextPage": next_page})
-
-@app.get("/suggest")
-async def suggest(q: str = Query(..., min_length=1)):
-    """
-    Suggestions via the public YouTube suggest endpoint (no key).
-    """
-    try:
-        r = await client.get(
-            "https://suggestqueries.google.com/complete/search",
-            params={"client": "youtube", "q": q, "hl": "en"},
-        )
-        r.raise_for_status()
-        data = r.json()
-        suggestions = []
-        # Format can be ['q', ['a','b','c'], ...]
-        if isinstance(data, list) and len(data) >= 2 and isinstance(data[1], list):
-            suggestions = [str(s) for s in data[1][:10]]
-        return cacheable({"suggestions": suggestions}, max_age=600)
-    except Exception:
-        return cacheable({"suggestions": []}, max_age=60)
-
-@app.get("/video/{video_id}")
-async def video(video_id: str):
-    """
-    Basic video details (tries Piped then Invidious).
-    """
-    # Piped video
-    try:
-        base, data = await fetch_first_ok(PIPED_INSTANCES, f"/api/v1/video/{video_id}", {})
-        thumbs = data.get("thumbnails") or data.get("thumbnail") or []
-        item = {
-            "id": video_id,
-            "title": data.get("title"),
-            "channelId": data.get("uploaderId") or data.get("uploaderUrl"),
-            "channelName": data.get("uploader"),
-            "publishedText": data.get("uploadedDate"),
-            "viewCount": data.get("views"),
-            "likeCount": data.get("likeCount"),
-            "commentCount": data.get("commentsCount") or data.get("commentCount"),
-            "thumbnails": _thumbs_to_set(thumbs if isinstance(thumbs, list) else None),
-        }
-        return cacheable(item)
-    except HTTPException:
-        pass
-
-    # Invidious fallback
-    base, data = await fetch_first_ok(INVIDIOUS_INSTANCES, f"/api/v1/videos/{video_id}", {})
-    item = {
-        "id": video_id,
-        "title": data.get("title"),
-        "channelId": data.get("authorId"),
-        "channelName": data.get("author"),
-        "publishedText": data.get("publishedText"),
-        "viewCount": data.get("viewCount"),
-        "likeCount": data.get("likeCount"),
-        "commentCount": data.get("commentCount"),
-        "thumbnails": _thumbs_to_set(data.get("videoThumbnails")),
-    }
-    return cacheable(item)
-
-# -------------------- Shutdown --------------------
 @app.on_event("shutdown")
 async def _shutdown():
-    await client.aclose()
+    global _http
+    if _http:
+        await _http.aclose()
+        _http = None
+
+
+# -------- models (Kotlin mirrors these) --------
+class Thumbnail(BaseModel):
+    url: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+
+
+class VideoItem(BaseModel):
+    id: str
+    title: str
+    channelName: Optional[str] = None
+    channelId: Optional[str] = None
+    viewCount: Optional[int] = 0
+    publishedText: Optional[str] = None
+    thumbnails: List[Thumbnail] = []
+
+
+class ChannelItem(BaseModel):
+    id: str
+    title: Optional[str] = None
+    avatar: Optional[str] = None
+    subscribersText: Optional[str] = None
+
+
+class SearchResponse(BaseModel):
+    items: List[dict]               # union {type:"video"/"channel", data: VideoItem/ChannelItem}
+    nextPage: Optional[int] = None
+
+
+class SuggestResponse(BaseModel):
+    suggestions: List[str]
+
+
+class ShortItemsResponse(BaseModel):
+    items: List[VideoItem]
+    nextPage: Optional[int] = None
+
+
+class CommentsResponse(BaseModel):
+    comments: List[dict]
+    # NOTE: key casing intentionally matches Piped/Android expectation
+    nextpage: Optional[str] = None
+
+
+# -------- helpers --------
+def thumbify(arr) -> List[Thumbnail]:
+    if not isinstance(arr, list):
+        return []
+    out: List[Thumbnail] = []
+    for t in arr:
+        out.append(
+            Thumbnail(
+                url=t.get("url"),
+                width=t.get("width"),
+                height=t.get("height"),
+            )
+        )
+    return out
+
+
+def map_invidious_video(v: dict) -> VideoItem:
+    return VideoItem(
+        id=(
+            v.get("videoId")
+            or v.get("videoIdShort")
+            or v.get("id", "")
+        ),
+        title=v.get("title", ""),
+        channelName=v.get("author"),
+        channelId=v.get("authorId"),
+        viewCount=v.get("viewCount") or v.get("viewCountText"),
+        publishedText=v.get("publishedText"),
+        thumbnails=thumbify(v.get("videoThumbnails") or v.get("thumbnails") or []),
+    )
+
+
+def map_invidious_channel(c: dict) -> ChannelItem:
+    avatar = None
+    thumbs = c.get("authorThumbnails") or c.get("thumbnails") or []
+    if thumbs:
+        avatar = thumbs[-1].get("url")
+    return ChannelItem(
+        id=c.get("authorId") or c.get("id", ""),
+        title=c.get("author") or c.get("title"),
+        avatar=avatar,
+        subscribersText=c.get("subCountText") or c.get("subscriberCountText"),
+    )
+
+
+# -------- endpoints --------
+@app.get("/health")
+async def health():
+    return {"ok": True, "invidious": INVIDIOUS_BASE, "piped": PIPED_BASE}
+
+
+@app.get("/v1/suggest", response_model=SuggestResponse)
+async def suggest(q: str = Query(..., min_length=1)):
+    # Simple quota-free variants
+    base = q.strip()
+    variants = list({base, f"{base} news", f"{base} tutorial", f"{base} live", f"{base} shorts"})
+    return SuggestResponse(suggestions=variants[:8])
+
+
+@app.get("/v1/search", response_model=SearchResponse)
+async def search(q: str, page: int = 1):
+    assert _http is not None
+    url = f"{INVIDIOUS_BASE}/api/v1/search"
+    params = {"q": q, "page": page, "type": "all"}
+    r = await _http.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+
+    items: List[dict] = []
+    for it in data:
+        t = it.get("type")
+        if t == "video":
+            items.append({"type": "video", "data": map_invidious_video(it).model_dump()})
+        elif t == "channel":
+            items.append({"type": "channel", "data": map_invidious_channel(it).model_dump()})
+
+    next_page = page + 1 if len(data) > 0 else None
+    return SearchResponse(items=items, nextPage=next_page)
+
+
+@app.get("/v1/channels", response_model=SearchResponse)
+async def channels(q: str, page: int = 1):
+    assert _http is not None
+    url = f"{INVIDIOUS_BASE}/api/v1/search"
+    params = {"q": q, "page": page, "type": "channel"}
+    r = await _http.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+
+    items = [{"type": "channel", "data": map_invidious_channel(it).model_dump()} for it in data]
+    return SearchResponse(items=items, nextPage=(page + 1 if items else None))
+
+
+@app.get("/v1/trending", response_model=SearchResponse)
+async def trending(page: int = 1, region: str = "US"):
+    # Invidious trending has no paging; emulate with slicing
+    assert _http is not None
+    url = f"{INVIDIOUS_BASE}/api/v1/trending"
+    params = {"region": region}
+    r = await _http.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+
+    per_page = 20
+    start = (page - 1) * per_page
+    end = start + per_page
+    chunk = data[start:end]
+    items = [{"type": "video", "data": map_invidious_video(v).model_dump()} for v in chunk]
+    next_page = page + 1 if end < len(data) else None
+    return SearchResponse(items=items, nextPage=next_page)
+
+
+@app.get("/v1/shorts", response_model=ShortItemsResponse)
+async def shorts(q: str = "#shorts", page: int = 1):
+    assert _http is not None
+    url = f"{INVIDIOUS_BASE}/api/v1/search"
+    params = {"q": q, "page": page, "type": "video", "shorts": "true"}
+    r = await _http.get(url, params=params)
+    r.raise_for_status()
+    data = r.json()
+
+    vids = [map_invidious_video(v).model_dump() for v in data if v.get("type") == "video"]
+    next_page = page + 1 if len(vids) > 0 else None
+    return ShortItemsResponse(items=vids, nextPage=next_page)
+
+
+@app.get("/v1/videoStats")
+async def video_stats(
+    ids: str = Query(..., description="comma-separated videoIds"),
+) -> Dict[str, Dict[str, int]]:
+    """
+    Returns a map: { videoId: { views, likes, comments } }
+    Invidious exposes /api/v1/videos/:id (likes, viewCount, commentCount* if available).
+    """
+    assert _http is not None
+    out: Dict[str, Dict[str, int]] = {}
+    id_list = [x.strip() for x in ids.split(",") if x.strip()]
+    for vid in id_list:
+        try:
+            r = await _http.get(f"{INVIDIOUS_BASE}/api/v1/videos/{vid}")
+            r.raise_for_status()
+            j = r.json()
+            out[vid] = {
+                "views": int(j.get("viewCount") or 0),
+                "likes": int(j.get("likeCount") or 0),
+                "comments": int(j.get("commentCount") or 0),
+            }
+        except Exception:
+            out[vid] = {"views": 0, "likes": 0, "comments": 0}
+    return out
+
+
+# -------- NEW: public comments via Piped (works for Shorts) --------
+@app.get("/v1/comments/{video_id}", response_model=CommentsResponse)
+async def comments(
+    video_id: str,
+    page: Optional[str] = Query(None, alias="page"),  # Android passes ?page=...; we forward as nextpage
+):
+    """
+    Proxies public YouTube comments using a Piped instance.
+    Returns { "comments": [...], "nextpage": "..." }.
+    If comments are disabled upstream, returns an empty list with nextpage=None.
+    """
+    assert _http is not None
+    vid = video_id.strip()
+    if not vid:
+        raise HTTPException(status_code=400, detail="video_id required")
+
+    url = f"{PIPED_BASE}/api/v1/comments/{vid}"
+    params = {}
+    if page:
+        params["nextpage"] = page
+
+    try:
+        r = await _http.get(url, params=params)
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        # Bubble up upstream status + body to help diagnose
+        raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+
+    data = r.json() or {}
+
+    # Piped may return {"disabled": true} for comments disabled
+    if data.get("disabled") is True:
+        return CommentsResponse(comments=[], nextpage=None)
+
+    comments = data.get("comments") or []
+    nextpage = data.get("nextpage") if data.get("nextpage") else None
+    return CommentsResponse(comments=comments, nextpage=nextpage)
+
+
+# -------- local dev entry --------
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+        reload=True,
+    )
