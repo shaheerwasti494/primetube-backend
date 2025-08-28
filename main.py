@@ -30,7 +30,7 @@ INVIDIOUS_POOL: List[str] = [b.strip().rstrip("/") for b in POOL_ENV.split(",") 
 if not INVIDIOUS_POOL:
     INVIDIOUS_POOL = [DEFAULT_INVIDIOUS]
 
-# NEW: Piped mirror pool with failover
+# Piped mirror pool with failover
 PIPED_POOL_ENV = os.getenv(
     "PIPED_POOL",
     ",".join([
@@ -62,7 +62,7 @@ def _dbg(msg: str):
         print(f"[UPSTREAM] {msg}")
 
 # ------------------ App ---------------------
-app = FastAPI(title="PrimeTube Backend", version="1.5.0")
+app = FastAPI(title="PrimeTube Backend", version="1.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -155,6 +155,20 @@ def _cacheable_nonempty(data: object) -> bool:
             return len(items) > 0
     return False
 
+# ------------------ Helpers ------------------
+def _merge_unique(seq: List[dict], key: str) -> List[dict]:
+    seen = set()
+    out = []
+    for it in seq:
+        k = it.get(key) or it.get("id") or it.get("videoId") or it.get("url")
+        if not k:
+            continue
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
+
 # ------------------ Invidious helpers ------------------
 def thumbify(arr) -> List[Thumbnail]:
     if not isinstance(arr, list):
@@ -222,13 +236,11 @@ async def _http_get_json(url: str, params: dict, accept_json: bool = True) -> ob
     async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
-        # Some mirrors reply HTML (Cloudflare). Guard json() failures.
-        ct = r.headers.get("content-type", "")
-        text = r.text
         try:
             return r.json()
         except Exception as e:
-            # If server said application/json but body isn't JSON, surface a clear error
+            # If server said JSON but body isn't JSON, surface a clear error
+            text = r.text
             raise httpx.HTTPStatusError(
                 f"Non-JSON body from {url}: {text[:120]}...",
                 request=r.request,
@@ -448,32 +460,65 @@ async def _trending_videos(region: str, shorts_only: bool) -> Tuple[List[dict], 
 
     return [], "none"
 
-# ---------- Unified Search (Invidious → Piped failover) ----------
+# ---------- Unified Search (deep Invidious + Piped fallback/merge) ----------
 async def _unified_search(q: str, page: int, kind: str, region: str) -> List[dict]:
-    # Invidious
+    # Invidious: try "all", then explicit "video" and "channel" and merge
     try:
-        inv_params = {"q": q, "page": page, "type": "all" if kind == "all" else kind, "region": region}
-        inv = await _get_json_with_failover("/api/v1/search", inv_params, cacheable=True)
-        if isinstance(inv, list) and inv:
-            return inv
-    except Exception as e:
-        _dbg(f"invidious search error: {e}")
+        merged: List[dict] = []
+        base_params = {"q": q, "page": page, "region": region}
 
-    # Piped
-    try:
-        piped_filter = {"all": "all", "video": "videos", "channel": "channels"}[kind]
-        pip = await _piped_json_with_failover("/api/search", {
-            "q": q,
-            "filter": piped_filter,
-            "sort": "relevance",
-            "region": region,
-            "page": page
-        })
-        items = pip.get("items") if isinstance(pip, dict) else None
-        if items:
-            return items
+        inv_all = await _get_json_with_failover("/api/v1/search", base_params, cacheable=True)
+        if isinstance(inv_all, list):
+            merged.extend(inv_all)
+
+        inv_vid = await _get_json_with_failover("/api/v1/search",
+                                                {**base_params, "type": "video"},
+                                                cacheable=True)
+        if isinstance(inv_vid, list):
+            merged.extend(inv_vid)
+
+        inv_ch = await _get_json_with_failover("/api/v1/search",
+                                               {**base_params, "type": "channel"},
+                                               cacheable=True)
+        if isinstance(inv_ch, list):
+            merged.extend(inv_ch)
+
+        merged = _merge_unique(merged, key="videoId")
+        if merged:
+            return merged
     except Exception as e:
-        _dbg(f"piped search error: {e}")
+        _dbg(f"invidious unified search error: {e}")
+
+    # Piped: when "all", query both videos and channels, then merge
+    try:
+        piped_items: List[dict] = []
+        if kind == "channel":
+            pip = await _piped_json_with_failover("/api/search", {
+                "q": q, "filter": "channels", "sort": "relevance", "page": page
+            })
+            items = pip.get("items") if isinstance(pip, dict) else None
+            if items:
+                piped_items.extend(items)
+        else:
+            pip_v = await _piped_json_with_failover("/api/search", {
+                "q": q, "filter": "videos", "sort": "relevance", "page": page
+            })
+            v_items = pip_v.get("items") if isinstance(pip_v, dict) else None
+            if v_items:
+                piped_items.extend(v_items)
+
+            if kind in ("all",):
+                pip_c = await _piped_json_with_failover("/api/search", {
+                    "q": q, "filter": "channels", "sort": "relevance", "page": page
+                })
+                c_items = pip_c.get("items") if isinstance(pip_c, dict) else None
+                if c_items:
+                    piped_items.extend(c_items)
+
+        piped_items = _merge_unique(piped_items, key="id")
+        return piped_items
+    except Exception as e:
+        _dbg(f"piped unified search error: {e}")
 
     return []
 
@@ -513,15 +558,27 @@ async def search(q: str, page: int = 1, region: str = "US"):
     items: List[dict] = []
     for it in raw:
         t = it.get("type")
+
+        # Invidious explicit
         if t == "video":
             items.append({"type": "video", "data": map_invidious_video(it).model_dump()})
-        elif t == "channel":
+            continue
+        if t == "channel":
             items.append({"type": "channel", "data": map_invidious_channel(it).model_dump()})
+            continue
+
+        # Heuristics for Piped items (search results)
+        if any(k in it for k in ("uploader", "uploaderName", "url", "thumbnail", "thumbnailUrl")):
+            items.append({"type": "video", "data": map_piped_video(it).model_dump()})
+        elif any(k in it for k in ("name", "avatarUrl")) or (it.get("channelId") and not it.get("url")):
+            items.append({"type": "channel", "data": map_piped_channel(it).model_dump()})
         else:
-            if any(k in it for k in ("thumbnail", "thumbnailUrl", "uploader", "uploaderName", "url")):
+            # Fallback try video then channel
+            try:
                 items.append({"type": "video", "data": map_piped_video(it).model_dump()})
-            elif it.get("type") == "channel" or any(k in it for k in ("name", "avatarUrl")):
+            except Exception:
                 items.append({"type": "channel", "data": map_piped_channel(it).model_dump()})
+
     next_page = page + 1 if raw else None
     return SearchResponse(items=items, nextPage=next_page)
 
@@ -611,6 +668,44 @@ async def video_stats(ids: str = Query(..., description="comma-separated videoId
         out[vid] = await fetch_one(vid)
 
     return out
+
+# -------- Related videos (Invidious → Piped fallback) ----------
+def map_invidious_related_item(x: dict) -> dict:
+    return {"type": "video", "data": map_invidious_video(x).model_dump()}
+
+def map_piped_related_item(x: dict) -> dict:
+    return {"type": "video", "data": map_piped_video(x).model_dump()}
+
+@app.get("/v1/related", response_model=SearchResponse)
+async def related(videoId: str = Query(..., min_length=3), page: int = 1, region: str = "US"):
+    # 1) Invidious
+    try:
+        data = await _get_json_with_failover(f"/api/v1/related/{videoId}", {"region": region}, cacheable=True)
+        if isinstance(data, list) and data:
+            items = [map_invidious_related_item(d) for d in data if isinstance(d, dict)]
+            per_page = 20
+            start, end = (page - 1) * per_page, page * per_page
+            chunk = items[start:end]
+            return SearchResponse(items=chunk, nextPage=(page + 1 if end < len(items) else None))
+    except Exception as e:
+        _dbg(f"invidious related error: {e}")
+
+    # 2) Piped fallback
+    try:
+        pip = await _piped_json_with_failover(f"/api/related/{videoId}", {})
+        if isinstance(pip, dict):
+            rel = pip.get("relatedStreams") or pip.get("items") or []
+        else:
+            rel = pip if isinstance(pip, list) else []
+        items = [map_piped_related_item(d) for d in rel if isinstance(d, dict)]
+        per_page = 20
+        start, end = (page - 1) * per_page, page * per_page
+        chunk = items[start:end]
+        return SearchResponse(items=chunk, nextPage=(page + 1 if end < len(items) else None))
+    except Exception as e:
+        _dbg(f"piped related error: {e}")
+
+    return SearchResponse(items=[], nextPage=None)
 
 # -------- Comments (Invidious → Piped fallback) ----------
 @app.get("/v1/comments", response_model=CommentsResponse)
