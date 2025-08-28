@@ -36,6 +36,38 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+# ------------ Safe env helpers (tolerate empty/invalid) ------------
+def _env_str(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
+
+
+def _env_int(name: str, default: int) -> int:
+    v = os.getenv(name)
+    if v in (None, "", "None", "null"):
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v in (None, "", "None", "null"):
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v in (None, ""):
+        return default
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
+
 try:
     from dotenv import load_dotenv
 
@@ -69,11 +101,11 @@ class Settings:
         if b.strip()
     ]
 
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-    CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
-    DEBUG_UPSTREAM = os.getenv("DEBUG_UPSTREAM", "0") == "1"
+    CORS_ORIGINS = _env_str("CORS_ORIGINS", "*")
+    CACHE_TTL_SECONDS = _env_int("CACHE_TTL_SECONDS", 300)
+    DEBUG_UPSTREAM = _env_bool("DEBUG_UPSTREAM", False)
 
-    USER_AGENT = os.getenv(
+    USER_AGENT = _env_str(
         "USER_AGENT",
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -83,10 +115,10 @@ class Settings:
     )
 
     # Discovery
-    DISCOVERY_ENABLED = os.getenv("DISCOVERY_ENABLED", "1") == "1"
-    DISCOVERY_INTERVAL_SECONDS = int(os.getenv("DISCOVERY_INTERVAL_SECONDS", "1800"))
-    INVIDIOUS_DISCOVERY_MAX = int(os.getenv("INVIDIOUS_DISCOVERY_MAX", "8"))
-    PIPED_DISCOVERY_MAX = int(os.getenv("PIPED_DISCOVERY_MAX", "5"))
+    DISCOVERY_ENABLED = _env_bool("DISCOVERY_ENABLED", True)
+    DISCOVERY_INTERVAL_SECONDS = _env_int("DISCOVERY_INTERVAL_SECONDS", 1800)
+    INVIDIOUS_DISCOVERY_MAX = _env_int("INVIDIOUS_DISCOVERY_MAX", 8)
+    PIPED_DISCOVERY_MAX = _env_int("PIPED_DISCOVERY_MAX", 5)
 
     INVIDIOUS_DISCOVERY_URL = os.getenv(
         "INVIDIOUS_DISCOVERY_URL", "https://api.invidious.io/instances.json"
@@ -96,7 +128,7 @@ class Settings:
         os.getenv("PIPED_DISCOVERY_URL2", "https://piped-instances.kavin.rocks/instances.json"),
     ]
 
-    HTTPX_TIMEOUT_SECONDS = float(os.getenv("HTTPX_TIMEOUT_SECONDS", "25.0"))
+    HTTPX_TIMEOUT_SECONDS = _env_float("HTTPX_TIMEOUT_SECONDS", 25.0)
 
 
 S = Settings()
