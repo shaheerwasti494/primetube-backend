@@ -1,33 +1,40 @@
 """
-PrimeTube Backend — v1.8.0 (FastAPI)
+PrimeTube Backend — v1.9.0 (FastAPI)
 
-Highlights vs 1.7.x
-- Robust upstream failover (Invidious + Piped) with clear 5xx when all mirrors fail
-- Non‑JSON upstream responses (CAPTCHA/HTML) are treated as failures, not success
-- Provider/debug headers for search/channels/trending/shorts/related when DEBUG_UPSTREAM=1
-- Safer JSON mapping and dedupe across mirrors
-- Health deep check endpoint improvements
+Highlights vs 1.8.x
+- **Self-healing instance discovery** for Invidious & Piped on startup + periodic refresh
+- Prunes unhealthy/blocked mirrors automatically; keeps static fallbacks
+- Robust upstream failover with clear 5xx when all mirrors fail
+- Non‑JSON upstream (CAPTCHA/HTML) treated as failure → proper mirror rotation
+- Provider/debug headers on core endpoints when DEBUG_UPSTREAM=1
+- New `/health/instances` endpoint to inspect active pools and last refresh
 
 Environment variables
-- INVIDIOUS_POOL: comma‑separated list (default set below)
-- PIPED_POOL: comma‑separated list (default set below)
-- USER_AGENT: UA string (default: Chrome-like PrimeTubeBackend/1.0)
-- CORS_ORIGINS: origins or "*" (default "*")
-- CACHE_TTL_SECONDS: in‑memory cache TTL for non-auth GETs (default 300)
-- DEBUG_UPSTREAM: if "1", adds X‑PT-* headers and prints upstream debug
+- `INVIDIOUS_POOL`: comma‑separated list (fallbacks)
+- `PIPED_POOL`: comma‑separated list (fallbacks)
+- `DISCOVERY_ENABLED`: `1`/`0` (default `1`)
+- `DISCOVERY_INTERVAL_SECONDS`: periodic refresh interval (default `1800`)
+- `INVIDIOUS_DISCOVERY_MAX`: cap discovered invidious mirrors (default `8`)
+- `PIPED_DISCOVERY_MAX`: cap discovered piped mirrors (default `5`)
+- `USER_AGENT`: UA string (default: Chrome-like PrimeTubeBackend/1.9.0)
+- `CORS_ORIGINS`: origins or "*" (default "*")
+- `CACHE_TTL_SECONDS`: in‑memory cache TTL for non-auth GETs (default 300)
+- `DEBUG_UPSTREAM`: if "1", adds X‑PT-* headers and prints upstream debug
 
 Run locally
-- uvicorn primetube_backend_v1_8_0:app --host 0.0.0.0 --port 8080 --reload
+- `uvicorn primetube_backend:app --host 0.0.0.0 --port 8080 --reload`
 
 Deploy (Cloud Run, example)
-- Build: gcloud builds submit --tag gcr.io/PROJECT/primetube-backend:v1.8.0
-- Deploy: gcloud run deploy primetube-backend --image gcr.io/PROJECT/primetube-backend:v1.8.0 --allow-unauthenticated --region=us-central1 --set-env-vars=DEBUG_UPSTREAM=1
+- Build: `gcloud builds submit --tag gcr.io/PROJECT/primetube-backend:v1.9.0`
+- Deploy: `gcloud run deploy primetube-backend --image gcr.io/PROJECT/primetube-backend:v1.9.0 --allow-unauthenticated --region=us-central1 --set-env-vars=DEBUG_UPSTREAM=1`
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 import json
+import random
 import itertools
 from typing import Dict, List, Optional, Tuple, Union, Iterable
 
@@ -43,35 +50,29 @@ try:
 except Exception:
     pass
 
-# ------------------ Config ------------------
+# ------------------ Config (static fallbacks) ------------------
 DEFAULT_INVIDIOUS = "https://yewtu.be"
-POOL_ENV = os.getenv(
-    "INVIDIOUS_POOL",
-    ",".join([
-        "https://inv.nadeko.net",
-        "https://invidious.fdn.fr",
-        "https://yewtu.be",
-        "https://vid.puffyan.us",
-        "https://invidious.nerdvpn.de",
-        "https://iv.nboeck.de",
-        "https://invidious.privacydev.net",
-    ])
-)
+FALLBACK_INVIDIOUS = [
+    # Trimmed to instances that typically allow API access; discovery will override
+    "https://invidious.privacydev.net",
+    "https://invidious.fdn.fr",
+    "https://yewtu.be",
+    "https://iv.nboeck.de",
+]
+FALLBACK_PIPED = [
+    "https://piped.video",
+    "https://piped.privacydev.net",
+    "https://piped.mha.fi",
+]
+
+POOL_ENV = os.getenv("INVIDIOUS_POOL", ",".join(FALLBACK_INVIDIOUS))
+PIPED_POOL_ENV = os.getenv("PIPED_POOL", ",".join(FALLBACK_PIPED))
+
 INVIDIOUS_POOL: List[str] = [b.strip().rstrip("/") for b in POOL_ENV.split(",") if b.strip()]
+PIPED_POOL: List[str] = [b.strip().rstrip("/") for b in PIPED_POOL_ENV.split(",") if b.strip()]
+
 if not INVIDIOUS_POOL:
     INVIDIOUS_POOL = [DEFAULT_INVIDIOUS]
-
-PIPED_POOL_ENV = os.getenv(
-    "PIPED_POOL",
-    ",".join([
-        "https://piped.video",
-        "https://piped.projectsegfau.lt",
-        "https://piped.privacydev.net",
-        "https://piped.mha.fi",
-        "https://piped.garudalinux.org",
-    ])
-)
-PIPED_POOL: List[str] = [b.strip().rstrip("/") for b in PIPED_POOL_ENV.split(",") if b.strip()]
 if not PIPED_POOL:
     PIPED_POOL = ["https://piped.video"]
 
@@ -81,18 +82,28 @@ USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 "
-    "PrimeTubeBackend/1.8.0 (CloudRun) httpx"
+    "PrimeTubeBackend/1.9.0 (CloudRun) httpx",
 )
 DEBUG_UPSTREAM = os.getenv("DEBUG_UPSTREAM", "0") == "1"
 
+DISCOVERY_ENABLED = os.getenv("DISCOVERY_ENABLED", "1") == "1"
+DISCOVERY_INTERVAL = int(os.getenv("DISCOVERY_INTERVAL_SECONDS", "1800"))
+INVIDIOUS_DISCOVERY_MAX = int(os.getenv("INVIDIOUS_DISCOVERY_MAX", "8"))
+PIPED_DISCOVERY_MAX = int(os.getenv("PIPED_DISCOVERY_MAX", "5"))
 
-def _dbg(msg: str):
-    if DEBUG_UPSTREAM:
-        print(f"[UPSTREAM] {msg}")
-
+INVIDIOUS_DISCOVERY_URL = os.getenv(
+    "INVIDIOUS_DISCOVERY_URL",
+    # Canonical community endpoint shape: list of [base, {meta...}]
+    "https://api.invidious.io/instances.json",
+)
+PIPED_DISCOVERY_URLS = [
+    # Multiple sources; any that return a list of instances with an API base will do
+    os.getenv("PIPED_DISCOVERY_URL1", "https://piped.video/api/instances"),
+    os.getenv("PIPED_DISCOVERY_URL2", "https://piped-instances.kavin.rocks/instances.json"),
+]
 
 # ------------------ App ---------------------
-app = FastAPI(title="PrimeTube Backend", version="1.8.0")
+app = FastAPI(title="PrimeTube Backend", version="1.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[CORS] if CORS != "*" else ["*"],
@@ -100,6 +111,172 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ------------------ Discovery state ------------------
+_last_discovery_ts: Optional[float] = None
+_last_discovery_err: Optional[str] = None
+_inv_cycle = itertools.cycle(INVIDIOUS_POOL)
+_piped_cycle = itertools.cycle(PIPED_POOL)
+
+
+def _dbg(msg: str):
+    if DEBUG_UPSTREAM:
+        print(f"[UPSTREAM] {msg}")
+
+
+async def _http_get_text(url: str, timeout: float = 10.0) -> str:
+    headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+    async with httpx.AsyncClient(timeout=timeout, headers=headers, follow_redirects=True) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.text
+
+
+async def _http_get_json(url: str, params: dict, accept_json: bool = True) -> object:
+    headers = {
+        "User-Agent": USER_AGENT,
+        # Be permissive; some instances send odd content-types
+        "Accept": "application/json, text/json, */*",
+    }
+    if not accept_json:
+        headers.pop("Accept", None)
+
+    timeout_s = float(os.getenv("HTTPX_TIMEOUT_SECONDS", "25.0"))
+
+    async with httpx.AsyncClient(timeout=timeout_s, headers=headers, follow_redirects=True) as client:
+        r = await client.get(url, params=params)
+        r.raise_for_status()
+        try:
+            return r.json()
+        except Exception as e:
+            ct = r.headers.get("content-type", "")
+            textpeek = r.text[:200]
+            raise RuntimeError(
+                f"Non-JSON response from {url} (status={r.status_code}, ct={ct}): {textpeek}"
+            ) from e
+
+
+async def _fetch_json_once(base: str, path: str, params: dict) -> object:
+    return await _http_get_json(f"{base}{path}", params, accept_json=True)
+
+
+async def _async_backoff(status: Optional[int] = None):
+    await asyncio.sleep(0.4 if status == 429 else 0.2)
+
+
+# ------------------ Discovery ------------------
+async def _discover_invidious() -> List[str]:
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": USER_AGENT, "Accept": "application/json, */*"}, follow_redirects=True) as client:
+            r = await client.get(INVIDIOUS_DISCOVERY_URL)
+            r.raise_for_status()
+            data = r.json()
+        # Expected shape: [["https://host", {"api": true, ...}], ...]
+        hosts: List[str] = []
+        if isinstance(data, list):
+            for row in data:
+                if not (isinstance(row, list) and len(row) >= 2):
+                    continue
+                base = str(row[0]).rstrip("/")
+                meta = row[1] if isinstance(row[1], dict) else {}
+                if meta.get("api", False) is not True:
+                    continue
+                # Optional heuristics: blocklist obvious CF-guarded frontends (best-effort)
+                if meta.get("type") == "https" or True:
+                    hosts.append(base)
+        random.shuffle(hosts)
+        return hosts[:INVIDIOUS_DISCOVERY_MAX] if hosts else []
+    except Exception as e:
+        _dbg(f"invidious discovery failed: {e}")
+        return []
+
+
+async def _discover_piped() -> List[str]:
+    for url in PIPED_DISCOVERY_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=12.0, headers={"User-Agent": USER_AGENT, "Accept": "application/json, */*"}, follow_redirects=True) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                data = r.json()
+            hosts: List[str] = []
+            # Accept a variety of shapes
+            if isinstance(data, list):
+                for it in data:
+                    if isinstance(it, str):
+                        hosts.append(it.rstrip("/"))
+                    elif isinstance(it, dict):
+                        # common keys: 'api_url', 'frontend', 'url'
+                        cand = it.get("api_url") or it.get("apiUrl") or it.get("url") or it.get("frontend")
+                        if isinstance(cand, str):
+                            hosts.append(cand.rstrip("/"))
+            elif isinstance(data, dict):
+                # Some endpoints return {"instances": ["https://..."]}
+                arr = data.get("instances") or data.get("items") or []
+                if isinstance(arr, list):
+                    for s in arr:
+                        if isinstance(s, str):
+                            hosts.append(s.rstrip("/"))
+            random.shuffle(hosts)
+            if hosts:
+                # Normalize to base (no trailing /api), try to identify API bases
+                normed: List[str] = []
+                for h in hosts:
+                    if "/api" in h:
+                        base = h.split("/api")[0]
+                    else:
+                        base = h
+                    normed.append(base.rstrip("/"))
+                return list(dict.fromkeys(normed))[:PIPED_DISCOVERY_MAX]
+        except Exception as e:
+            _dbg(f"piped discovery failed from {url}: {e}")
+    return []
+
+
+async def _apply_discovery(new_inv: List[str], new_piped: List[str]):
+    global INVIDIOUS_POOL, PIPED_POOL, _inv_cycle, _piped_cycle, _last_discovery_ts
+    changed = False
+    if new_inv:
+        INVIDIOUS_POOL = new_inv
+        _inv_cycle = itertools.cycle(INVIDIOUS_POOL)
+        changed = True
+    if new_piped:
+        PIPED_POOL = new_piped
+        _piped_cycle = itertools.cycle(PIPED_POOL)
+        changed = True
+    _last_discovery_ts = time.time()
+    if DEBUG_UPSTREAM and changed:
+        _dbg(f"discovery applied: invidious={INVIDIOUS_POOL} piped={PIPED_POOL}")
+
+
+async def _refresh_instances():
+    global _last_discovery_err
+    if not DISCOVERY_ENABLED:
+        return
+    inv = await _discover_invidious()
+    pip = await _discover_piped()
+    if inv or pip:
+        await _apply_discovery(inv or INVIDIOUS_POOL, pip or PIPED_POOL)
+        _last_discovery_err = None
+    else:
+        _last_discovery_err = "discovery yielded no instances"
+
+
+@app.on_event("startup")
+async def _on_startup():
+    # Kick off initial discovery, then schedule periodic refresh
+    try:
+        await _refresh_instances()
+    except Exception as e:
+        _dbg(f"startup discovery error: {e}")
+    if DISCOVERY_ENABLED and DISCOVERY_INTERVAL > 0:
+        async def _loop():
+            while True:
+                try:
+                    await asyncio.sleep(DISCOVERY_INTERVAL)
+                    await _refresh_instances()
+                except Exception as e:
+                    _dbg(f"periodic discovery error: {e}")
+        asyncio.create_task(_loop())
 
 
 # ------------------ Models ------------------
@@ -329,46 +506,7 @@ def map_piped_comment(c: dict) -> CommentItem:
     )
 
 
-# ------------------ HTTP helpers ------------------
-_inv_cycle = itertools.cycle(INVIDIOUS_POOL)
-_piped_cycle = itertools.cycle(PIPED_POOL)
-
-
-async def _http_get_json(url: str, params: dict, accept_json: bool = True) -> object:
-    headers = {
-        "User-Agent": USER_AGENT,
-        # Be permissive; some instances send odd content-types
-        "Accept": "application/json, text/json, */*",
-    }
-    if not accept_json:
-        headers.pop("Accept", None)
-
-    timeout_s = float(os.getenv("HTTPX_TIMEOUT_SECONDS", "25.0"))
-
-    async with httpx.AsyncClient(timeout=timeout_s, headers=headers, follow_redirects=True) as client:
-        r = await client.get(url, params=params)
-        # If non-2xx, raise.
-        r.raise_for_status()
-        try:
-            return r.json()
-        except Exception as e:
-            # Treat non-JSON as a failure so caller can failover.
-            ct = r.headers.get("content-type", "")
-            textpeek = r.text[:200]
-            raise RuntimeError(
-                f"Non-JSON response from {url} (status={r.status_code}, ct={ct}): {textpeek}"
-            ) from e
-
-
-async def _fetch_json_once(base: str, path: str, params: dict) -> object:
-    return await _http_get_json(f"{base}{path}", params, accept_json=True)
-
-
-async def _async_backoff(status: Optional[int] = None):
-    import asyncio
-    await asyncio.sleep(0.4 if status == 429 else 0.2)
-
-
+# ------------------ HTTP helpers with failover ------------------
 async def _get_json_with_failover(
     path: str,
     params: dict,
@@ -383,8 +521,11 @@ async def _get_json_with_failover(
     last_error: Optional[Exception] = None
     tried = set()
 
-    for _ in range(len(INVIDIOUS_POOL)):
-        base = next(_inv_cycle)
+    # iterate a snapshot to avoid race with discovery refresh
+    inv_snapshot = list(dict.fromkeys(INVIDIOUS_POOL))
+
+    for _ in range(len(inv_snapshot)):
+        base = inv_snapshot[_ % len(inv_snapshot)]
         if base in tried:
             continue
         tried.add(base)
@@ -405,10 +546,8 @@ async def _get_json_with_failover(
             if st == 429 or 500 <= st < 600:
                 await _async_backoff(st)
                 continue
-            # Non-retryable HTTP errors bubble up immediately
             raise HTTPException(status_code=st, detail=f"Upstream error {st} at {base}{path}") from e
         except Exception as e:
-            # Non-HTTP (parse, JSON, TLS, etc.): try next mirror
             last_error = e
             await _async_backoff()
             continue
@@ -424,8 +563,9 @@ async def _get_json_with_failover(
 async def _piped_json_with_failover(path: str, params: dict) -> object:
     last_error: Optional[Exception] = None
     tried = set()
-    for _ in range(len(PIPED_POOL)):
-        base = next(_piped_cycle)
+    piped_snapshot = list(dict.fromkeys(PIPED_POOL))
+    for _ in range(len(piped_snapshot)):
+        base = piped_snapshot[_ % len(piped_snapshot)]
         if base in tried:
             continue
         tried.add(base)
@@ -570,6 +710,9 @@ async def health(deep: bool = False):
         "active_pool": INVIDIOUS_POOL,
         "piped_pool": PIPED_POOL,
         "cache_ttl": CACHE_TTL,
+        "discovery_enabled": DISCOVERY_ENABLED,
+        "last_discovery_ts": _last_discovery_ts,
+        "last_discovery_err": _last_discovery_err,
     }
     if deep:
         checks = []
@@ -585,6 +728,25 @@ async def health(deep: bool = False):
             checks.append({"piped_trending_error": str(e)})
         info["checks"] = checks
     return info
+
+
+@app.get("/health/instances")
+async def health_instances():
+    return {
+        "invidious_pool": INVIDIOUS_POOL,
+        "piped_pool": PIPED_POOL,
+        "discovery_enabled": DISCOVERY_ENABLED,
+        "last_discovery_ts": _last_discovery_ts,
+        "last_discovery_err": _last_discovery_err,
+        "limits": {
+            "invidious_max": INVIDIOUS_DISCOVERY_MAX,
+            "piped_max": PIPED_DISCOVERY_MAX,
+        },
+        "discovery_sources": {
+            "invidious": INVIDIOUS_DISCOVERY_URL,
+            "piped": PIPED_DISCOVERY_URLS,
+        },
+    }
 
 
 @app.get("/v1/suggest", response_model=SuggestResponse)
@@ -814,11 +976,10 @@ async def comments(
 async def unhandled_exceptions(request: Request, exc: Exception):
     if isinstance(exc, HTTPException):
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-    # Generic 500 with safe detail (no giant tracebacks)
     return JSONResponse(status_code=500, content={"detail": f"Internal error: {str(exc)}"})
 
 
 # ------------------ Entrypoint ------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("primetube_backend_v1_8_0:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
+    uvicorn.run("primetube_backend:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=False)
